@@ -12,7 +12,7 @@ Torben Østergård and further developed by Markus Schaffer at Aalborg Universit
 pip install -e .
 
 # Or build and install
-pip install satom_python
+pip install git+https://github.com/markus-schaffer/satom_python.git
 ```
 
 ## Quick start
