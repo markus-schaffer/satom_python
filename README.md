@@ -9,10 +9,10 @@ Torben Østergård and further developed by Markus Schaffer at Aalborg Universit
 
 ```bash
 # From local source (editable / development mode)
-pip install -e ./satom_python
+pip install -e .
 
 # Or build and install
-pip install ./satom_python
+pip install satom_python
 ```
 
 ## Quick start
