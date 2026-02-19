@@ -25,7 +25,7 @@ from satom import SAtom
 rng = np.random.default_rng(123)
 N = 10_000
 X = rng.uniform(-np.pi, np.pi, size=(N, 3))
-a, b = 2, 1
+a, b = 7, 0.1
 Y = np.sin(X[:, 0]) + a * np.sin(X[:, 1])**2 + b * X[:, 2]**4 * np.sin(X[:, 0])
 
 # Run SAtom
