@@ -3,7 +3,7 @@
 **Sensitivity Analysis using the Kolmogorov-Smirnov 2-sample test (TOM method)**
 
 A Python implementation of the SAtom method originally developed in MATLAB by
-Torben Østergård at Aalborg University.
+Torben Østergård and further developed by Markus Schaffer at Aalborg University.
 
 ## Installation
 
