@@ -11,7 +11,7 @@ license = {text = "BSD-2-Clause"}
 requires-python = ">=3.9"
 authors = [
     {name = "Torben Østergård", email = "tostergard@build.aau.dk"},
-    {name = "Markus Schaffer", email = "msc@build.aau.dk"},
+    {name = "Markus Schaffer", email = "msch@build.aau.dk"},
 ]
 keywords = ["sensitivity-analysis", "kolmogorov-smirnov", "TOM", "building-simulation"]
 classifiers = [
@@ -39,8 +39,8 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/markus-schaffer/satom_dev"
-Repository = "https://github.com/markus-schaffer/satom_dev"
+Homepage = "https://github.com/markus-schaffer/satom_python"
+Repository = "https://github.com/markus-schaffer/satom_python"
 
 [tool.setuptools.packages.find]
 where = ["src"]
