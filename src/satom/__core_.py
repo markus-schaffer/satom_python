@@ -1,7 +1,7 @@
 """
 SAtom – Sensitivity Analysis using the Kolmogorov-Smirnov 2-sample test (TOM method).
 
-Translated from MATLAB (SAtom v1.0.0) by Torben Østergård, Aalborg University.
+Translated from MATLAB (SAtom v1.0.0) by Torben Østergård and Markus Schaffer, Aalborg University.
 
 References
 ----------
