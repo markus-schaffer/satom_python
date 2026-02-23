@@ -8,7 +8,7 @@ version = "1.0.0"
 description = "SAtom – Sensitivity Analysis using the Kolmogorov-Smirnov 2-sample test (TOM method)"
 readme = "README.md"
 license = {text = "BSD-2-Clause"}
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 authors = [
     {name = "Torben Østergård", email = "tostergard@build.aau.dk"},
     {name = "Markus Schaffer", email = "msch@build.aau.dk"},
@@ -20,7 +20,6 @@ classifiers = [
     "License :: OSI Approved :: BSD License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -33,9 +32,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+fast = [
+    "numba>=0.60.0",
+]
 dev = [
     "pytest>=7.0",
     "pytest-cov",
+    "pandas",
+    "openpyxl",
 ]
 
 [project.urls]

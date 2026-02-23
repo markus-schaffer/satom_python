@@ -25,10 +25,121 @@ import matplotlib.pyplot as plt
 import numpy as np
 from numpy.typing import ArrayLike
 
+try:
+    from numba import njit
+
+    _HAS_NUMBA = True
+except ModuleNotFoundError:  # pragma: no cover
+    _HAS_NUMBA = False
+
+    def njit(*args, **kwargs):  # noqa: D103 – stub
+        """Identity decorator when Numba is not installed."""
+        if args and callable(args[0]):
+            return args[0]
+        return lambda f: f
+
+
+# =========================================================================
+# Numba-accelerated KS row computation
+# =========================================================================
+
+
+@njit(cache=True)
+def _ks_row_mode01(mask, orderMat, uniformCDF, N, nIn):
+    """KS row for SScompare 0 or 1 (one-sample vs uniform).
+
+    Fuses indexing + cumsum + max into a single pass per column,
+    eliminating temporary array allocations.
+    """
+    ks_row = np.empty(nIn, dtype=np.float64)
+    n2 = 0.0
+    for i in range(N):
+        if mask[i]:
+            n2 += 1.0
+    for col in range(nIn):
+        running_sum = 0.0
+        max_d = 0.0
+        for row in range(N):
+            idx = orderMat[row, col]
+            if mask[idx]:
+                running_sum += 1.0
+            cdf2 = running_sum / n2
+            d = abs(uniformCDF[row] - cdf2)
+            if d > max_d:
+                max_d = d
+        ks_row[col] = max_d
+    return ks_row
+
+
+@njit(cache=True)
+def _ks_row_mode2(maskB, maskN, orderMat, N, nIn):
+    """KS row for SScompare 2 (behavioural vs non-behavioural).
+
+    Fuses both CDFs + max into a single pass per column.
+    """
+    ks_row = np.empty(nIn, dtype=np.float64)
+    n1 = 0.0
+    n2 = 0.0
+    for i in range(N):
+        if maskB[i]:
+            n1 += 1.0
+        if maskN[i]:
+            n2 += 1.0
+    for col in range(nIn):
+        sum1 = 0.0
+        sum2 = 0.0
+        max_d = 0.0
+        for row in range(N):
+            idx = orderMat[row, col]
+            if maskB[idx]:
+                sum1 += 1.0
+            if maskN[idx]:
+                sum2 += 1.0
+            d = abs(sum1 / n1 - sum2 / n2)
+            if d > max_d:
+                max_d = d
+        ks_row[col] = max_d
+    return ks_row
+
+
+@njit(cache=True)
+def _build_mask(randStart, YsortedIdx, N, nOut, subsetSize):
+    """Build the behavioural mask for one iteration (Numba-accelerated).
+
+    Parameters
+    ----------
+    randStart : 1-D int array of length nOut, 1-based start positions.
+    YsortedIdx : 2-D int array (nOut, N), 0-based original row indices
+                 sorted by each output.
+    N, nOut, subsetSize : int
+
+    Returns
+    -------
+    maskB : bool array of length N
+    remaining : int – number of True values in maskB
+    """
+    maskB = np.ones(N, dtype=np.bool_)
+    for idxY in range(nOut):
+        idxStart = randStart[idxY]  # 1-based
+        maskTmp = np.zeros(N, dtype=np.bool_)
+        for k in range(subsetSize + 1):
+            sortedPos = (idxStart - 1 + k) % N
+            origIdx = YsortedIdx[idxY, sortedPos]
+            maskTmp[origIdx] = True
+        for i in range(N):
+            if not maskTmp[i]:
+                maskB[i] = False
+    remaining = 0
+    for i in range(N):
+        if maskB[i]:
+            remaining += 1
+    return maskB, remaining
+
 
 # =========================================================================
 # Helper: Switch matplotlib backend
 # =========================================================================
+
 
 def _switch_backend(gui: str) -> None:
     """Force-switch the matplotlib backend, reimporting pyplot."""
@@ -49,6 +160,7 @@ def SAtom(
     SScompare: int = 0,
     X_label: Sequence[str] | None = None,
     seed: int = 42,
+    use_numba: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     """TOM sensitivity analysis using the Kolmogorov-Smirnov 2-sample test.
 
@@ -81,6 +193,10 @@ def SAtom(
         Labels for each input variable in *X*.  Default: None (auto-generated).
     seed : int
         Random seed for reproducibility.  Default: 42
+    use_numba : bool
+        If ``True`` (default), use Numba JIT-compiled inner loop for
+        faster KS computation.  Set to ``False`` to use the pure-NumPy
+        fallback (useful for benchmarking or environments without Numba).
 
     Returns
     -------
@@ -136,6 +252,15 @@ def SAtom(
     ):
         raise ValueError("checkInterval must be a non-negative integer.")
 
+    # Resolve Numba availability
+    if use_numba and not _HAS_NUMBA:
+        warnings.warn(
+            "Numba is not installed – falling back to pure-NumPy mode. "
+            "Install numba (pip install satom[fast]) for ~5-10× speedup.",
+            stacklevel=2,
+        )
+        use_numba = False
+
     # Subset data (double precision throughout)
     X = X[:N].copy()
     Y = Y[:N].copy()
@@ -185,15 +310,12 @@ def SAtom(
 
     subsetSize = max(1, int(np.floor(0.5 ** (1.0 / nOut) * N)))
 
-    # MATLAB: indexVector = (1:N)' → 1-based
-    indexVector = np.arange(1, N + 1, dtype=np.float64)
-
     # Precompute sorted index arrays for each output
-    YtempSorted: list[np.ndarray] = []
+    # YsortedIdx[idxY, k] = 0-based original row at position k when
+    # output idxY is sorted ascending
+    YsortedIdx = np.empty((nOut, N), dtype=np.intp)
     for idxY in range(nOut):
-        augmented = np.column_stack([Y, indexVector])
-        order = np.argsort(augmented[:, idxY], kind="mergesort")
-        YtempSorted.append(augmented[order])
+        YsortedIdx[idxY, :] = np.argsort(Y[:, idxY], kind="mergesort")
 
     # Precompute sorted indices for each input column
     orderMat = np.empty((N, nIn), dtype=np.uint32)
@@ -205,9 +327,10 @@ def SAtom(
     if SScompare in (0, 1):
         uniformCDF = np.arange(1, N + 1, dtype=np.float64) / float(N)
 
-    # Cache-aware chunk size (8 bytes per float64)
-    cacheBytes = 32e6
-    chunkSize = max(1, int(np.floor(cacheBytes / (8 * N * 2))))
+    # Cache-aware chunk size for NumPy fallback (8 bytes per float64)
+    if not use_numba:
+        cacheBytes = 32e6
+        chunkSize = max(1, int(np.floor(cacheBytes / (8 * N * 2))))
 
     # MATLAB: randStarts = ceil(rand(J*10, nOut) * N) → 1-based [1..N]
     randStarts = np.ceil(rng.rand(J * 10, nOut) * N).astype(np.intp)
@@ -228,9 +351,7 @@ def SAtom(
         originalBackend = matplotlib.get_backend()
         _switch_backend("QtAgg")
         plt.ion()
-        convFig, convAx = plt.subplots(
-            1, 1, num="TOM: Interactive Convergence Check"
-        )
+        convFig, convAx = plt.subplots(1, 1, num="TOM: Interactive Convergence Check")
         nextCheck = checkInterval
 
     # ------------------------------------------------------------------
@@ -245,66 +366,74 @@ def SAtom(
             randStarts = np.concatenate([randStarts, newStarts], axis=0)
 
         # Build behavioural mask
-        maskB = np.ones(N, dtype=bool)
-        for idxY in range(nOut):
-            idxStart = randStarts[randIdx, idxY]
-
-            # MATLAB colon is inclusive → length = subsetSize + 1
-            idxRange = np.mod(
-                np.arange(idxStart - 1, idxStart - 1 + subsetSize + 1), N
-            ) + 1
-
-            # Retrieve 1-based original row indices, convert to 0-based
-            idxBBefore = YtempSorted[idxY][idxRange - 1, nOut]
-
-            maskTmp = np.zeros(N, dtype=bool)
-            maskTmp[(idxBBefore - 1).astype(np.intp)] = True
-            maskB &= maskTmp
+        if use_numba:
+            maskB, remaining = _build_mask(
+                randStarts[randIdx], YsortedIdx, N, nOut, subsetSize
+            )
+        else:
+            maskB = np.ones(N, dtype=bool)
+            for idxY in range(nOut):
+                idxStart = randStarts[randIdx, idxY]
+                sortedPositions = np.mod(
+                    np.arange(idxStart - 1, idxStart - 1 + subsetSize + 1), N
+                )
+                origIndices = YsortedIdx[idxY, sortedPositions]
+                maskTmp = np.zeros(N, dtype=bool)
+                maskTmp[origIndices] = True
+                maskB &= maskTmp
+            remaining = int(maskB.sum())
 
         randIdx += 1
 
-        remaining = int(maskB.sum())
         if remaining == 0 or remaining == N:
             continue
 
-        # --- Compute KS row (with cache-aware chunking) -------------------
-        if SScompare == 0:  # Non-behavioural vs. all
-            maskN = ~maskB
-            n2 = float(N - remaining)
-            for colStart in range(0, nIn, chunkSize):
-                colEnd = min(colStart + chunkSize, nIn)
-                cols = slice(colStart, colEnd)
-                m2_chunk = maskN[orderMat[:, cols]].astype(np.float64)
-                cdf2_chunk = np.cumsum(m2_chunk, axis=0) / n2
-                KS[rep, cols] = np.max(
-                    np.abs(uniformCDF[:, np.newaxis] - cdf2_chunk), axis=0
-                )
-
-        elif SScompare == 1:  # Behavioural vs. all
-            n2 = float(remaining)
-            for colStart in range(0, nIn, chunkSize):
-                colEnd = min(colStart + chunkSize, nIn)
-                cols = slice(colStart, colEnd)
-                m2_chunk = maskB[orderMat[:, cols]].astype(np.float64)
-                cdf2_chunk = np.cumsum(m2_chunk, axis=0) / n2
-                KS[rep, cols] = np.max(
-                    np.abs(uniformCDF[:, np.newaxis] - cdf2_chunk), axis=0
-                )
-
-        else:  # SScompare == 2: Non-behavioural vs. behavioural
-            maskN = ~maskB
-            n1 = float(remaining)
-            n2 = float(N - remaining)
-            for colStart in range(0, nIn, chunkSize):
-                colEnd = min(colStart + chunkSize, nIn)
-                cols = slice(colStart, colEnd)
-                m1_chunk = maskB[orderMat[:, cols]].astype(np.float64)
-                m2_chunk = maskN[orderMat[:, cols]].astype(np.float64)
-                cdf1_chunk = np.cumsum(m1_chunk, axis=0) / n1
-                cdf2_chunk = np.cumsum(m2_chunk, axis=0) / n2
-                KS[rep, cols] = np.max(
-                    np.abs(cdf1_chunk - cdf2_chunk), axis=0
-                )
+        # --- Compute KS row -----------------------------------------------
+        if use_numba:
+            # Numba-accelerated: single fused pass per column
+            if SScompare == 0:  # Non-behavioural vs. all
+                maskN = ~maskB
+                KS[rep, :] = _ks_row_mode01(maskN, orderMat, uniformCDF, N, nIn)
+            elif SScompare == 1:  # Behavioural vs. all
+                KS[rep, :] = _ks_row_mode01(maskB, orderMat, uniformCDF, N, nIn)
+            else:  # SScompare == 2
+                maskN = ~maskB
+                KS[rep, :] = _ks_row_mode2(maskB, maskN, orderMat, N, nIn)
+        else:
+            # Pure-NumPy fallback with cache-aware chunking
+            if SScompare == 0:  # Non-behavioural vs. all
+                maskN = ~maskB
+                n2 = float(N - remaining)
+                for colStart in range(0, nIn, chunkSize):
+                    colEnd = min(colStart + chunkSize, nIn)
+                    cols = slice(colStart, colEnd)
+                    m2_chunk = maskN[orderMat[:, cols]]
+                    cdf2_chunk = np.cumsum(m2_chunk, axis=0, dtype=np.float64) / n2
+                    KS[rep, cols] = np.max(
+                        np.abs(uniformCDF[:, np.newaxis] - cdf2_chunk), axis=0
+                    )
+            elif SScompare == 1:  # Behavioural vs. all
+                n2 = float(remaining)
+                for colStart in range(0, nIn, chunkSize):
+                    colEnd = min(colStart + chunkSize, nIn)
+                    cols = slice(colStart, colEnd)
+                    m2_chunk = maskB[orderMat[:, cols]]
+                    cdf2_chunk = np.cumsum(m2_chunk, axis=0, dtype=np.float64) / n2
+                    KS[rep, cols] = np.max(
+                        np.abs(uniformCDF[:, np.newaxis] - cdf2_chunk), axis=0
+                    )
+            else:  # SScompare == 2
+                maskN = ~maskB
+                n1 = float(remaining)
+                n2 = float(N - remaining)
+                for colStart in range(0, nIn, chunkSize):
+                    colEnd = min(colStart + chunkSize, nIn)
+                    cols = slice(colStart, colEnd)
+                    m1_chunk = maskB[orderMat[:, cols]]
+                    m2_chunk = maskN[orderMat[:, cols]]
+                    cdf1_chunk = np.cumsum(m1_chunk, axis=0, dtype=np.float64) / n1
+                    cdf2_chunk = np.cumsum(m2_chunk, axis=0, dtype=np.float64) / n2
+                    KS[rep, cols] = np.max(np.abs(cdf1_chunk - cdf2_chunk), axis=0)
 
         rep += 1
 
@@ -345,9 +474,10 @@ def SAtom(
     # Trim to completed iterations
     KS = KS[:actualJ]
 
-    KS2_J_mean = np.cumsum(KS, axis=0) / np.arange(
-        1, actualJ + 1, dtype=np.float64
-    )[:, np.newaxis]
+    KS2_J_mean = (
+        np.cumsum(KS, axis=0)
+        / np.arange(1, actualJ + 1, dtype=np.float64)[:, np.newaxis]
+    )
 
     # Output (already float64)
     KS2_mean = np.mean(KS, axis=0)
@@ -379,9 +509,7 @@ def SAtom(
         ax_conv.set_ylabel(r"Mean of $D_{ij}$")
         if actualJ > 10:
             ax_conv.set_xlim(10, actualJ)
-        ax_conv.legend(
-            loc="center left", bbox_to_anchor=(1.0, 0.5), fontsize="small"
-        )
+        ax_conv.legend(loc="center left", bbox_to_anchor=(1.0, 0.5), fontsize="small")
         fig_conv.tight_layout()
         plt.show()
 
@@ -391,6 +519,7 @@ def SAtom(
 # =========================================================================
 # Helper: Interactive convergence checkpoint
 # =========================================================================
+
 
 def _convergence_checkpoint(
     KS: np.ndarray,
@@ -402,9 +531,10 @@ def _convergence_checkpoint(
     """Display running convergence plot and ask user to continue or stop."""
 
     KS_partial = KS[:currentJ]
-    cumMean = np.cumsum(KS_partial, axis=0) / np.arange(
-        1, currentJ + 1, dtype=np.float64
-    )[:, np.newaxis]
+    cumMean = (
+        np.cumsum(KS_partial, axis=0)
+        / np.arange(1, currentJ + 1, dtype=np.float64)[:, np.newaxis]
+    )
 
     currentMean = np.mean(KS_partial, axis=0)
     rank = np.argsort(currentMean)[::-1]
